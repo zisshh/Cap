@@ -1,7 +1,7 @@
 import { db } from "@cap/database";
 import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
-import { getCurrentUser } from "@cap/database/auth/session";
+import type { getCurrentUser } from "@cap/database/auth/session";
 import {
 	authApiKeys,
 	developerApiKeys,
@@ -329,6 +329,7 @@ async function findDeveloperSecretKey(
 			appId: developerApps.id,
 			keyId: developerApiKeys.id,
 			ownerId: developerApps.ownerId,
+			ownerEmail: users.email,
 		})
 		.from(developerApiKeys)
 		.innerJoin(
@@ -338,6 +339,7 @@ async function findDeveloperSecretKey(
 				isNull(developerApps.deletedAt),
 			),
 		)
+		.innerJoin(users, eq(developerApps.ownerId, users.id))
 		.where(
 			and(
 				eq(developerApiKeys.keyHash, keyHash),
@@ -346,9 +348,9 @@ async function findDeveloperSecretKey(
 			),
 		)
 		.limit(1);
-	if (!row) return null;
+	if (!row || isBlockedAccountEmail(row.ownerEmail)) return null;
 	debouncedLastUsedUpdate(keyHash);
-	return row;
+	return { appId: row.appId, keyId: row.keyId, ownerId: row.ownerId };
 }
 
 const unknownSecretKey = () =>
@@ -479,7 +481,7 @@ function debouncedLastUsedUpdate(keyHash: string) {
 		.catch((err) => console.error("Failed to update lastUsedAt:", err));
 }
 
-async function getAuth(c: Context) {
+export async function getAuth(c: Context) {
 	const authHeader = c.req.header("authorization")?.split(" ")[1];
 
 	let user: Awaited<ReturnType<typeof getCurrentUser>> | undefined;
@@ -493,6 +495,7 @@ async function getAuth(c: Context) {
 		user = res[0]?.users;
 		if (user && isBlockedAccountEmail(user.email)) user = undefined;
 	} else if (!isCrossSiteCookieWrite(c.req.raw)) {
+		const { getCurrentUser } = await import("@cap/database/auth/session");
 		user = await getCurrentUser();
 	}
 
@@ -606,6 +609,7 @@ export const withDeveloperUploadToken = createMiddleware<{
 			deletedAt: developerVideos.deletedAt,
 			keyId: developerApiKeys.id,
 			keyRevokedAt: developerApiKeys.revokedAt,
+			ownerEmail: users.email,
 		})
 		.from(developerVideos)
 		.innerJoin(
@@ -615,6 +619,7 @@ export const withDeveloperUploadToken = createMiddleware<{
 				isNull(developerApps.deletedAt),
 			),
 		)
+		.innerJoin(users, eq(developerApps.ownerId, users.id))
 		.leftJoin(
 			developerApiKeys,
 			and(
@@ -637,6 +642,10 @@ export const withDeveloperUploadToken = createMiddleware<{
 			),
 			404,
 		);
+	}
+
+	if (isBlockedAccountEmail(video.ownerEmail)) {
+		return c.json(uploadTokenRefusal("invalid"), 401);
 	}
 
 	if (keyId === undefined) {

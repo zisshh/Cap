@@ -256,6 +256,7 @@ pub struct RecordingItem {
     /// left to an `<img onError>`.
     pub thumbnail: Option<PathBuf>,
     pub thumbnail_version: Option<u128>,
+    pub audio_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -344,6 +345,9 @@ fn recording_item(path: PathBuf, meta: RecordingMeta, sort_time_millis: f64) -> 
         RecordingMetaInner::Instant(_) => 1,
     };
     let status = recording_status(&meta);
+    let audio_only = meta
+        .studio_meta()
+        .is_some_and(StudioRecordingMeta::is_audio_only);
 
     #[cfg(test)]
     RECORDING_ITEM_BUILDS.with(|builds| builds.set(builds.get() + 1));
@@ -354,6 +358,9 @@ fn recording_item(path: PathBuf, meta: RecordingMeta, sort_time_millis: f64) -> 
     } else {
         bundle_thumbnail_path(&path)
     };
+    let thumbnail = (!audio_only)
+        .then_some(thumbnail)
+        .filter(|thumbnail| thumbnail.is_file());
     let upload = crate::upload::queue::status(&path, &meta);
     RecordingItem {
         upload,
@@ -363,8 +370,9 @@ fn recording_item(path: PathBuf, meta: RecordingMeta, sort_time_millis: f64) -> 
         pretty_name: meta.pretty_name,
         sharing: meta.sharing.map(|sharing| sharing.link),
         sort_time_millis,
-        thumbnail_version: source_mtime_nanos(&thumbnail),
-        thumbnail: thumbnail.is_file().then_some(thumbnail),
+        thumbnail_version: thumbnail.as_deref().and_then(source_mtime_nanos),
+        thumbnail,
+        audio_only,
         path,
     }
 }
@@ -636,19 +644,46 @@ fn is_storage_full(error: &cap_recording::recovery::RecoveryError) -> bool {
 /// Recovers a studio recording that a crash, a force quit or a failed stop left
 /// unfinished, so the editor can open it. Returns whether it recovered
 /// anything. Complete recordings, the recording being captured right now and
-/// bundles outside the library are left alone.
+/// bundles outside the library are left alone, and so is a recording that
+/// still needs its remux but `opens_as_is` (the editor reads its fragments
+/// directly, as it always has) and holds no footage that direct read skips.
 pub fn recover_interrupted_for_editing(
     project_path: &Path,
     active_recording: Option<&Path>,
+    opens_as_is: impl FnOnce(&Path) -> bool,
 ) -> Result<bool, String> {
-    recover_interrupted_for_editing_in(&known_recordings_dirs(), project_path, active_recording)
+    recover_interrupted_for_editing_in(
+        &known_recordings_dirs(),
+        project_path,
+        active_recording,
+        opens_as_is,
+    )
 }
 
 fn recover_interrupted_for_editing_in(
     dirs: &[PathBuf],
     project_path: &Path,
     active_recording: Option<&Path>,
+    opens_as_is: impl FnOnce(&Path) -> bool,
 ) -> Result<bool, String> {
+    let active = active_recording.is_some_and(|active| {
+        active == project_path || active.canonicalize().ok() == project_path.canonicalize().ok()
+    });
+    let library_path = project_path.canonicalize().ok().and_then(|canonical| {
+        dirs.iter().find_map(|dir| {
+            let relative = canonical.strip_prefix(dir.canonicalize().ok()?).ok()?;
+            Some(dir.join(relative))
+        })
+    });
+    let Some(library_path) = library_path.filter(|_| !active) else {
+        return Ok(false);
+    };
+    let project_path = library_path.as_path();
+    // A recovery an earlier run left part way (or an older build stranded)
+    // is put back first, so everything below sees the original layout.
+    if let Err(error) = RecoveryManager::restore_interrupted_recovery(project_path) {
+        tracing::warn!(path = %project_path.display(), %error, "could not settle an interrupted recovery before editing");
+    }
     let Ok(meta) = RecordingMeta::load_for_project(project_path) else {
         return Ok(false);
     };
@@ -657,21 +692,17 @@ fn recover_interrupted_for_editing_in(
     };
     let interrupted = match studio.status() {
         StudioRecordingStatus::Complete => false,
-        StudioRecordingStatus::NeedsRemux | StudioRecordingStatus::Failed { .. } => true,
-        StudioRecordingStatus::InProgress => !active_recording.is_some_and(|active| {
-            active == project_path || active.canonicalize().ok() == project_path.canonicalize().ok()
-        }),
+        // The editor reads only the top-level fragments, so footage from a
+        // restarted muxer or a pending fragment needs recovery to join it.
+        StudioRecordingStatus::NeedsRemux => {
+            RecoveryManager::has_media_beyond_direct_read(project_path, studio)
+                || !opens_as_is(project_path)
+        }
+        StudioRecordingStatus::Failed { .. } | StudioRecordingStatus::InProgress => true,
     };
-    let library_path = project_path.canonicalize().ok().and_then(|canonical| {
-        dirs.iter().find_map(|dir| {
-            let relative = canonical.strip_prefix(dir.canonicalize().ok()?).ok()?;
-            Some(dir.join(relative))
-        })
-    });
-    let Some(library_path) = library_path.filter(|_| interrupted) else {
+    if !interrupted {
         return Ok(false);
-    };
-    let project_path = library_path.as_path();
+    }
     if RecoveryManager::inspect_recording(project_path).is_none() {
         let has_segments = match studio {
             StudioRecordingMeta::MultipleSegments { inner } => !inner.segments.is_empty(),
@@ -851,6 +882,10 @@ impl Drop for ProjectBeingDeleted {
     fn drop(&mut self) {
         DELETING_PROJECTS.release(self.0);
     }
+}
+
+pub fn is_being_deleted(path: &Path) -> bool {
+    DELETING_PROJECTS.holds_resolved(path)
 }
 
 /// Existing targets and roots are canonicalized before containment is checked.
@@ -1428,7 +1463,7 @@ fn drain_decode_jobs<J, R>(
 /// this app's own identifier (cache data is regenerable, so it belongs where
 /// backups and migration skip it), not the `so.cap.desktop` app-data dir both
 /// apps share.
-fn thumbnail_cache_dir() -> PathBuf {
+pub(crate) fn thumbnail_cache_dir() -> PathBuf {
     // Verification runs point CAP_GPUI_APP_DATA_DIR at a sandbox; a cache that
     // still wrote to the user's real one would leak state across runs.
     if std::env::var("CAP_GPUI_APP_DATA_DIR").is_ok_and(|dir| !dir.trim().is_empty()) {
@@ -1748,6 +1783,92 @@ pub fn create_screenshot(
             let _ = std::fs::remove_file(&staged);
             e.to_string()
         })
+}
+
+/// Skips a near-black first frame (camera warm-up, fade in) for one a tenth
+/// in. Only the Library uses it: `create_screenshot` keeps the first frame
+/// so bundle thumbnails and uploads stay as they were.
+pub fn write_representative_frame(input: &Path, output: &Path) -> Result<(), String> {
+    let mut frame = first_video_frame(input)?;
+    if mean_luma(&frame) < 0.08
+        && let Ok(later) = video_frame_at_fraction(input, 0.1)
+        && mean_luma(&later) > mean_luma(&frame)
+    {
+        frame = later;
+    }
+    let (w, h) = (frame.width().max(1), frame.height().max(1));
+    let width = w.min(640);
+    let height = ((u64::from(h) * u64::from(width) / u64::from(w)).max(2) as u32) & !1;
+    let jpeg = match encode_mjpeg(&frame, (width & !1, height)) {
+        Some(jpeg) => jpeg,
+        None => encode_rgb_jpeg(&frame, (width & !1, height))?,
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let staged = output.with_extension(format!("jpg.tmp-{}", crate::store::new_uuid_v4()));
+    std::fs::write(&staged, jpeg)
+        .and_then(|()| std::fs::rename(&staged, output))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            e.to_string()
+        })
+}
+
+fn mean_luma(frame: &ffmpeg::frame::Video) -> f32 {
+    use ffmpeg::format::Pixel;
+    let (plane, step, offset) = match frame.format() {
+        Pixel::BGRA | Pixel::RGBA | Pixel::ARGB | Pixel::ABGR => (0, 4, 1),
+        Pixel::RGB24 | Pixel::BGR24 => (0, 3, 1),
+        _ => (0, 1, 0),
+    };
+    let data = frame.data(plane);
+    let stride = frame.stride(plane).max(1);
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    for y in (0..h).step_by((h / 24).max(1)) {
+        for x in (0..w).step_by((w / 32).max(1)) {
+            if let Some(v) = data.get(y * stride + x * step + offset) {
+                sum += u64::from(*v);
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return 1.;
+    }
+    sum as f32 / n as f32 / 255.
+}
+
+fn video_frame_at_fraction(input: &Path, fraction: f64) -> Result<ffmpeg::frame::Video, String> {
+    let mut ictx = ffmpeg::format::input(input).map_err(|e| e.to_string())?;
+    let duration = ictx.duration();
+    if duration > 0 {
+        let at = (duration as f64 * fraction) as i64;
+        ictx.seek(at, ..at).map_err(|e| e.to_string())?;
+    }
+    let input_stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or("No video stream found")?;
+    let video_stream_index = input_stream.index();
+    let mut decoder = ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
+        .map_err(|e| e.to_string())?
+        .decoder()
+        .video()
+        .map_err(|e| e.to_string())?;
+    let mut frame = ffmpeg::frame::Video::empty();
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != video_stream_index {
+            continue;
+        }
+        decoder.send_packet(&packet).map_err(|e| e.to_string())?;
+        if decoder.receive_frame(&mut frame).is_ok() {
+            return Ok(frame);
+        }
+    }
+    Err("No frame there".to_string())
 }
 
 fn first_video_frame(input: &Path) -> Result<ffmpeg::frame::Video, String> {
@@ -3370,7 +3491,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            recover_interrupted_for_editing_in(dirs, &complete, None),
+            recover_interrupted_for_editing_in(dirs, &complete, None, |_| false),
             Ok(false)
         );
 
@@ -3383,7 +3504,7 @@ mod tests {
         );
         let live_before = std::fs::read(live.join("recording-meta.json")).unwrap();
         assert_eq!(
-            recover_interrupted_for_editing_in(dirs, &live, Some(&live)),
+            recover_interrupted_for_editing_in(dirs, &live, Some(&live), |_| false),
             Ok(false)
         );
         assert_eq!(
@@ -3399,7 +3520,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            recover_interrupted_for_editing_in(dirs, &foreign, None),
+            recover_interrupted_for_editing_in(dirs, &foreign, None, |_| false),
             Ok(false)
         );
 
@@ -3410,7 +3531,7 @@ mod tests {
             "InProgress",
             false,
         );
-        let error = recover_interrupted_for_editing_in(dirs, &empty, None).unwrap_err();
+        let error = recover_interrupted_for_editing_in(dirs, &empty, None, |_| false).unwrap_err();
         assert!(error.starts_with("No video was saved"), "{error}");
         assert!(error.contains(&empty.display().to_string()), "{error}");
 
@@ -3423,7 +3544,8 @@ mod tests {
         );
         let fragment = damaged.join("content/segments/segment-0/display/segment_001.m4s");
         let fragment_before = std::fs::read(&fragment).unwrap();
-        let error = recover_interrupted_for_editing_in(dirs, &damaged, None).unwrap_err();
+        let error =
+            recover_interrupted_for_editing_in(dirs, &damaged, None, |_| false).unwrap_err();
         assert!(error.contains("Nothing was deleted"), "{error}");
         assert_eq!(std::fs::read(&fragment).unwrap(), fragment_before);
 
@@ -3435,6 +3557,7 @@ mod tests {
                 std::slice::from_ref(&linked),
                 &damaged.canonicalize().unwrap(),
                 None,
+                |_| false,
             )
             .unwrap_err();
             assert!(
@@ -3442,6 +3565,153 @@ mod tests {
                 "an editor path in canonical form still reaches recovery: {error}"
             );
         }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn bundle_files(bundle: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![bundle.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name != ".recovery.lock")
+                {
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.insert(path.strip_prefix(bundle).unwrap().to_path_buf(), bytes);
+                }
+            }
+        }
+        files
+    }
+
+    fn needs_remux_bundle(recordings: &Path, name: &str) -> PathBuf {
+        let bundle = write_bundle(
+            recordings,
+            name,
+            r#"{"pretty_name":"Cap 2026-11-10 at 09.00.00","sharing":null,"segments":[{"display":{"path":"content/segments/segment-0/display","fps":30}}],"status":{"status":"NeedsRemux"}}"#,
+        );
+        let display = bundle.join("content/segments/segment-0/display");
+        std::fs::create_dir_all(&display).unwrap();
+        std::fs::write(display.join("init.mp4"), vec![0u8; 128]).unwrap();
+        for index in 1..=3 {
+            std::fs::write(
+                display.join(format!("segment_{index:03}.m4s")),
+                complete_m4s_fragment(),
+            )
+            .unwrap();
+        }
+        bundle
+    }
+
+    #[test]
+    fn a_recording_that_still_needs_its_remux_opens_as_it_did_before_0_6_3() {
+        let root = temp_dir("needs-remux-open");
+        let recordings = root.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+        let dirs = std::slice::from_ref(&recordings);
+        let bundle = needs_remux_bundle(&recordings, "Google Flow - Copy (2)");
+        let before = bundle_files(&bundle);
+
+        let mut asked = None;
+        let opened = recover_interrupted_for_editing_in(dirs, &bundle, None, |path| {
+            asked = Some(path.to_path_buf());
+            true
+        });
+        assert_eq!(opened, Ok(false));
+        assert_eq!(asked.as_deref(), Some(bundle.as_path()));
+        assert_eq!(bundle_files(&bundle), before, "nothing was rewritten");
+
+        // One the editor cannot read goes through recovery, and a recovery
+        // that fails leaves every file where it was.
+        let error = recover_interrupted_for_editing_in(dirs, &bundle, None, |_| false).unwrap_err();
+        assert!(error.contains("Nothing was deleted"), "{error}");
+        assert_eq!(bundle_files(&bundle), before);
+        assert!(
+            std::fs::read_dir(&bundle)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".recovery-")),
+            "a failed recovery leaves no copy behind"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_recording_whose_muxer_restarted_goes_through_recovery_instead_of_opening_part_of_it() {
+        let root = temp_dir("needs-remux-restarted");
+        let recordings = root.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+        let dirs = std::slice::from_ref(&recordings);
+        let bundle = needs_remux_bundle(&recordings, "restarted");
+        let respawn = bundle.join("content/segments/segment-0/display/respawn-1");
+        std::fs::create_dir_all(&respawn).unwrap();
+        std::fs::write(respawn.join("init.mp4"), vec![0u8; 128]).unwrap();
+        std::fs::write(respawn.join("segment_001.m4s"), complete_m4s_fragment()).unwrap();
+        let before = bundle_files(&bundle);
+
+        // The editor would read only the footage before the restart, so it is
+        // not even asked; recovery runs, and failing, changes nothing.
+        let error = recover_interrupted_for_editing_in(dirs, &bundle, None, |_| {
+            panic!("a restarted recording must not open from its first muxer alone")
+        })
+        .unwrap_err();
+        assert!(error.contains("Nothing was deleted"), "{error}");
+        assert_eq!(bundle_files(&bundle), before);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_recording_an_older_build_left_without_its_media_is_restored_when_opened() {
+        let root = temp_dir("stranded-open");
+        let recordings = root.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+        let dirs = std::slice::from_ref(&recordings);
+        let bundle = needs_remux_bundle(&recordings, "stranded");
+        let before = bundle_files(&bundle);
+
+        // The 0.6.3 layout: the original fragments in the recovery backup, the
+        // rebuilt output (and an emptied fragment folder) in the project, and
+        // the original metadata, since the publication never replaced it.
+        let workspace = bundle.join(".recovery-5f0b7c1e-2d4a-4c8e-9a61-3b7d2e9f4c10");
+        std::fs::create_dir_all(workspace.join("staged/content")).unwrap();
+        std::fs::rename(
+            bundle.join("content/segments"),
+            workspace.join("original-segments"),
+        )
+        .unwrap();
+        std::fs::copy(
+            bundle.join("recording-meta.json"),
+            workspace.join("original-recording-meta.json"),
+        )
+        .unwrap();
+        let rebuilt = bundle.join("content/segments/segment-0");
+        std::fs::create_dir_all(rebuilt.join("display")).unwrap();
+        std::fs::write(rebuilt.join("display.mp4"), b"rebuilt output").unwrap();
+
+        let opened = recover_interrupted_for_editing_in(dirs, &bundle, None, |path| {
+            path.join("content/segments/segment-0/display/segment_003.m4s")
+                .is_file()
+        });
+        assert_eq!(opened, Ok(false), "the editor opens the restored fragments");
+        let after = bundle_files(&bundle);
+        for (path, bytes) in &before {
+            assert_eq!(after.get(path), Some(bytes), "{path:?}");
+        }
+        assert_eq!(
+            std::fs::read(workspace.join("displaced-segments/segment-0/display.mp4")).unwrap(),
+            b"rebuilt output",
+            "nothing is deleted"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
